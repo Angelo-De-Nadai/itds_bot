@@ -94,7 +94,35 @@ def roll_itds(dice=2, extra=0, score=0, skill=0, bonus_penalty=0, difficulty=1):
     successes=r_reduced.count(1)
     return result+f', ottenendo **{successes+1+bonus_penalty} successi**, se il tiro è inferiore al punteggio di caratteristica'
 
-# Parsing dei messaggi discord che richiedono il tiro di dadi
+
+# import classe personaggio
+from itdschargen import fromjson
+# setup delle variabili globali del bot
+user_characters = {}
+
+
+def associate_character_to_user(msg):
+  '''Associa un personaggio a un utente nel dizionario user_characters
+  msg      contenuto di un messaggio discord che contiene il nome del personaggio
+  '''
+  global user_characters
+  author = str(msg.author).split("#")[0]  # estrae il nome dell'autore del messaggio
+  content = msg.content.strip()  # ottiene il contenuto del messaggio
+  if not content.startswith('!choose'):
+    return "Comando non valido. Usa '!choose <nome_personaggio>'."
+
+  character_name = content[len('!choose '):].strip()  # rimuove '!choose' e ottiene il nome del personaggio
+
+  try:
+    character = fromjson(f'./json/{character_name}.json')  # carica il personaggio dal file JSON
+  except FileNotFoundError:
+    return f"Personaggio {character_name} non trovato."
+
+  user_characters[author] = character  # associa il personaggio all'utente
+  return f"Personaggio {character_name} associato all'utente **{author}**."
+
+
+# Parsing dei messaggi discord che richiedono il tiro di dadi senza personaggio associato
 import re
 rg=r"(?P<dice>\d+)d\s*(?P<drop>\d*)(\s*a(?P<skill>\d+)){0,1}(\s*(?P<bonus_sign>\+|\-)(?P<bonus_value>\d+)){0,1}(\s*vs\s*(?P<score>\d+)){0,1}"
 rgc=re.compile(rg, re.IGNORECASE)
@@ -117,7 +145,50 @@ def parse_and_roll(msg):
     skill = int(d['skill']), 
     bonus_penalty=int(d['bonus_value'])*(-1 if d['bonus_sign']=='-' else 1) # converte il segno +/-
   )
-  
+
+
+def find_characteristic_for_skill(skill, caratteristiche):
+  """Cerca un'abilità specifica all'interno di tutte le caratteristiche e restituisce il valore della caratteristica associata."""
+  for key, details in caratteristiche.items():
+    if skill in details.abilità:  # Accede all'attributo abilità della classe Caratteristica, che è una lista
+      return details.caratteristica  # Restituisce il valore della caratteristica
+  return None
+
+
+# Parsing dei messaggi discord che richiedono il tiro di dadi con personaggio associato
+rg = r"(?P<dice>\d+)d\s*(?P<skill>\w+)(\s*(?P<bonus_sign>\+|\-)?(?P<bonus_value>\d+))?"
+rgc = re.compile(rg, re.IGNORECASE)
+
+def character_based_parse_and_roll(msg):
+  '''Interpreta un messaggio discord che contiene una specifica per il lancio di dadi ed esegue il lancio
+  msg      contenuto di un messaggio discord
+  returns  stringa di testo che descrive il risultato
+  '''
+  global user_characters
+  author = str(msg.author).split("#")[0]  # estrae il nome dell'autore del messaggio
+  character = user_characters[author]
+  content = msg.content
+  # Match del messaggio per estrarre i parametri
+  res = rgc.search(content)  # esegue il match
+  if not res: return None  # match fallito
+  d = res.groupdict()  # estrae i dati
+  for x in d:  # imposta i default
+    if not d[x]: d[x] = 0
+  print(d)
+  dice = int(d['dice'])
+  if d['skill'] not in character.abilità: return None
+  extra = character.abilità[d['skill']].dado_extra
+  score = find_characteristic_for_skill(d['skill'], character.caratteristiche)
+  if score == None : return None
+  skill = character.abilità[d['skill']].grado
+  bonus_penalty = int(d['bonus_value']) * (-1 if d['bonus_sign'] == '-' else 1)  # converte il segno +/-
+  return roll_itds(
+    dice=dice - extra,  # qui rimuove i dadi extra dal totale, poiché roll li considera in automatico
+    extra=extra,
+    score=score,
+    skill=skill,
+    bonus_penalty=bonus_penalty
+  )
 
 
 # Il resto dell'applicazione è più o meno adattata da bot.py
@@ -155,7 +226,7 @@ async def on_message(msg):
   content = msg.content
   # creazione di un personaggio già iniziata
   if author in creator_process: # se è attivo il processo di creazione, interagisce con esso
-    creator_process[author].sendline(content)  # invia il contenuto del messaggio 
+    creator_process[author].sendline(content)  # invia il contenuto del messaggio
     p = creator_process[author].expect(prompt) # attende che sia completata sulla pipe la risposta dal programma di creazione
     response = creator_process[author].before  # estrae la risposta dalla pipe: tutto ciò che è stato stampato
     if p==0: # prompt[0] è il vero prompt, indica che la creazione non è finita
@@ -167,9 +238,18 @@ async def on_message(msg):
       await msg.channel.send(f"**{author}** ha creato {nome}", file=discord.File(f'./pdf/{nome}.pdf')) # invia il file PDF sulla chat
       del creator_process[author] # rimuove il creator_process, riabilitando gli altri comandi
   # tutti i comandi successivi sono vincolati a creator_process == None: durante la creazione del personaggio non è possibile eseguire altri comandi
+  # Aggiungere l'opzione per scegliere un personaggio
+  if '!choose' in content and author not in creator_process:
+    character_name = content.split(' ', 1)[1].strip()
+    response = associate_character_to_user(msg)
+    await msg.channel.send(response)
   # prova a parsare il messaggio come lancio di dadi ed eseguirlo
-  res = parse_and_roll(content)   
-  if res and author not in creator_process: 
+  res = None
+  if author in user_characters:
+    res = character_based_parse_and_roll(msg)
+  else:
+    res = parse_and_roll(content)
+  if res and author not in creator_process:
     await msg.channel.send(f'**{author}**'+res)
   # creazione di un personaggio casuale; questo comando è autocontenuto, quindi creator_process viene creato e poi distrutto
   if '!itdsrand' in content and author not in creator_process:
@@ -212,6 +292,7 @@ async def on_message(msg):
  Creazione dei personaggi giocanti:
     !itdsc       Creazione del personaggio interattiva
     !itdsrand    Creazione di un personaggio casuale
+    !choose <nome_personaggio>    Scegliere un personaggio esistente
  Generazione casuale di nomi:
     !n[omi] [m|f] [N] [regione|lingua]
       [m|f]     default: maschile
@@ -219,12 +300,18 @@ async def on_message(msg):
       [regione|lingua] default: Latino
         regioni {list(namegen.regions.keys())}
         lingue  {list(namegen.names['male'].keys())}
- Lancio dei dadi:
+ Lancio dei dadi associato al proprio personaggio(usa '!choose' per scegliere il tuo personaggio):
+    Nd <skill> [+N|-N]
+      Nd lancia N dadi a 6 faccie
+      <skill> abilità da applicare ai dadi
+      [+N|-N] applica N successi bonus o penalità
+ Lancio dei dadi senza personaggio associato:
     Nd[X] [aN] [+N|-N] [vs N]
       Nd[X] lancia Nd6, scarta gli X più alti
       [aN] applica ai dadi residui un punteggio di abilità pari a N
       [+N|-N] applica N successi bonus o penalità
       [vs N] confronta il risultato con un punteggio di caratteristica pari a N
+
     """
     await msg.channel.send(response)
 
